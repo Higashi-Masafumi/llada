@@ -4,6 +4,7 @@ import numpy as np
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 from utils import log_print
+from typing import Any
 
 
 def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -71,7 +72,7 @@ def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tenso
 
 @torch.no_grad()
 def generate(
-    model: AutoModel,
+    model: Any,  # Automodel.from_pretrainedで読み込んだモデル
     device: str,
     prompt: torch.Tensor,
     steps: int = 128,
@@ -100,13 +101,110 @@ def generate(
     """
     # 初期化：プロンプトの後ろに生成長文のマスクトークンを連結したsequenceを作成
     # 最初はすべての生成部分がマスクされている状態（mask_idで埋められている）
-    x = torch.full(size=(1, prompt.shape[1] + gen_length), fill_value=mask_id, dtype=torch.long).to(device=device)
+    x = torch.full(
+        size=(1, prompt.shape[1] + gen_length), fill_value=mask_id, dtype=torch.long
+    ).to(device=device)
     # プロンプト部分はそのままコピーしてmask_idを更新する
-    x[:, :prompt.shape[1]] = prompt.clone()
+    x[:, : prompt.shape[1]] = prompt.clone()
 
-    #　プロンプト部分の位置を記録（CFGや再マスキングで変更が行われないように）
-    prompt_index = (x != mask_id)
-    ...
+    # 　プロンプト部分の位置を記録（CFGや再マスキングで変更が行われないように）
+    prompt_index = x != mask_id
+    assert (
+        gen_length % block_length == 0
+    ), "生成長はブロック長で割り切れる必要があります。"
+    num_blocks = gen_length // block_length
 
+    assert steps % num_blocks == 0, "ステップ数はブロック数で割り切れる必要があります。"
+    steps = steps // num_blocks
 
+    for num_block in range(num_blocks):
+        # ブロック内のマスク位置を取得する
+        block_mask_index = (
+            x[
+                :,
+                prompt.shape[1]
+                + num_block * block_length : prompt.shape[1]
+                + (num_block + 1) * block_length :,
+            ]
+            == mask_id
+        )
+        # 各ステップで確定させるトークン数を計算する
+        num_transfer_tokens = get_num_transfer_tokens(
+            mask_index=block_mask_index, steps=steps
+        )
+        # デノイズ（復元）ループ
+        for i in range(steps):
+            # 現在のシーケンス全体でマスクされている位置を取得
+            mask_index = x == mask_id
 
+            # Classifier-Free Guidance(CFG)を使用する場合
+            if cfg_scale > 0:
+                # プロンプトがマスクされていない「条件付き」入力を作成
+                un_x = x.clone()
+                # プロンプト部分をマスクした「条件なし」入力を作成
+                un_x[prompt_index] = mask_id
+                # 「条件あり」と「条件なし」の入力を結合してモデルに一度に入力
+                x_ = torch.cat([x, un_x], dim=0)
+                logits = model(x_).logits
+                # 出力を分割して「条件あり」と「条件なし」のlogitsを取得
+                logits, un_logits = torch.chunk(input=logits, chunks=2, dim=0)
+                # CFGの式に従って、プロンプトの方向性を強めたlogitsを計算する
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                # CFGを利用しない場合は通常通りモデルで予測
+                logits = model(x).logits
+            # サンプリング：次のトークンを予測
+            logits_with_noise = add_gumbel_noise(
+                logits=logits,
+                temperature=temerature,
+            )
+            # ノイズ付きスコアが最も高いトークンを予測結果とする
+            x0 = torch.argmax(input=logits_with_noise, dim=1)
+
+            # 再マスキング戦略
+            if remasking == "low_confidence":
+                # softmaxでlogitsを確率に変換する
+                p = F.softmax(input=logits, dim=1)
+                # 予測されたトークン(x0)が持つ確率（自信度）を取得する
+                x0_p = torch.squeeze(
+                    input=torch.gather(
+                        input=p,
+                        dim=-1,
+                        index=torch.unsqueeze(input=x0, dim=-1),
+                    ),
+                    dim=-1,
+                )
+            elif remasking == "random":
+                # ランダムな値が自信度として使用される
+                x0_p = torch.rand(size=(x0.shape[0], x0.shape[1]), device=x0.device)
+            else:
+                raise NotImplementedError(remasking)
+
+            # 現在のブロック以降の自信度は計算対象外とする
+            x0_p[:, prompt.shape[1] + (num_block + 1) * block_length :] = -np.inf
+
+            # sequenceの更新
+            # マスクされている位置は予測トークン(x0)で、それ以外は元のトークン(x)で埋める
+            x0 = torch.where(condition=mask_index, input=x0, other=x)
+            # マスク位置の自信度をconfidenceとして保持する
+            confidence = torch.where(condition=mask_index, input=x0_p, other=-np.inf)
+
+            # 確定させるトークンを選択するためのインデックスを作成
+            transfer_index = torch.zeros_like(
+                input=x0, dtype=torch.bool, device=x0.device
+            )
+            # バッチ内の各sequenceで処理（バッチごとの処理）
+            for j in range(confidence.shape[0]):
+                # 自信度が上位k個のトークンを選択する（k=このステップで確定させるトークン数）
+                _, select_index = torch.topk(
+                    input=confidence[j],
+                    k=int(
+                        num_transfer_tokens[j, i]
+                    ),  # 各ステップで確定させるトークン数
+                )
+                # 選択された位置をTrueに設定する
+                transfer_index[j, select_index] = True
+            # 選択された位置のトークンを予測されたトークンで更新する
+            x[transfer_index] = x0[transfer_index]
+
+    return x
