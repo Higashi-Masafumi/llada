@@ -2,7 +2,6 @@ from typing import Literal
 import torch
 import numpy as np
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
 from utils import log_print
 from typing import Any
 
@@ -73,12 +72,11 @@ def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tenso
 @torch.no_grad()
 def generate(
     model: Any,  # Automodel.from_pretrainedで読み込んだモデル
-    device: str,
     prompt: torch.Tensor,
     steps: int = 128,
     gen_length: int = 128,
     block_length: int = 128,
-    temerature: int = 0,
+    temperature: int = 0,
     cfg_scale: int = 0,
     remasking: Literal["low_confidence", "random"] = "low_confidence",
     mask_id: int = 126336,
@@ -103,7 +101,7 @@ def generate(
     # 最初はすべての生成部分がマスクされている状態（mask_idで埋められている）
     x = torch.full(
         size=(1, prompt.shape[1] + gen_length), fill_value=mask_id, dtype=torch.long
-    ).to(device=device)
+    ).to(device=model.device)
     # プロンプト部分はそのままコピーしてmask_idを更新する
     x[:, : prompt.shape[1]] = prompt.clone()
 
@@ -156,15 +154,15 @@ def generate(
             # サンプリング：次のトークンを予測
             logits_with_noise = add_gumbel_noise(
                 logits=logits,
-                temperature=temerature,
+                temperature=temperature,
             )
             # ノイズ付きスコアが最も高いトークンを予測結果とする
-            x0 = torch.argmax(input=logits_with_noise, dim=1)
+            x0 = torch.argmax(input=logits_with_noise, dim=-1)
 
             # 再マスキング戦略
             if remasking == "low_confidence":
                 # softmaxでlogitsを確率に変換する
-                p = F.softmax(input=logits, dim=1)
+                p = F.softmax(input=logits, dim=-1)
                 # 予測されたトークン(x0)が持つ確率（自信度）を取得する
                 x0_p = torch.squeeze(
                     input=torch.gather(
