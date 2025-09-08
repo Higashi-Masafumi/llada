@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
-from transformers.generation.utils import CausalLMOutputWithPast
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 
 from dream.components.decoder import DreamDecoder
 from dream.components.rms_norm import DreamRMSNorm

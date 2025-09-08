@@ -1,11 +1,12 @@
 import torch
 from torch.nn import functional as F
-from transformers import GenerationConfig, LogitsProcessorList
+from transformers import GenerationConfig
 from transformers.generation.utils import (
-    CausalLMOutputWithPast,
-    GenerateOutput,
     GenerationMixin,
 )
+from transformers.generation.utils import GenerateOutput
+from transformers.utils.generic import ModelOutput
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from dream.sample_helper import sample_tokens
 
 
@@ -21,6 +22,7 @@ class DreamGenerationConfig(GenerationConfig):
         algorithm_temperature: float = 0.0,
         output_history: bool = False,
         mask_token_id: int | None = None,
+        eps: float = 1e-3,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -34,6 +36,12 @@ class DreamGenerationConfig(GenerationConfig):
         self.algorithm_temperature = algorithm_temperature
         self.output_history = output_history
         self.mask_token_id = mask_token_id
+        self.eps = eps
+
+
+class DreamModelOutput(ModelOutput):
+    sequences: torch.LongTensor = None
+    history: tuple[torch.FloatTensor] | None = None
 
 
 class DreamGenerationMixin(GenerationMixin):
@@ -44,7 +52,7 @@ class DreamGenerationMixin(GenerationMixin):
         attention_mask: torch.LongTensor | None = None,
         generation_config: DreamGenerationConfig | None = None,
         **kwargs,
-    ) -> GenerateOutput:
+    ) -> DreamModelOutput:
         """拡散モデルでテキストを生成する。
 
         Args:
@@ -63,31 +71,25 @@ class DreamGenerationMixin(GenerationMixin):
             else self.generation_config
         )
 
+        max_length = config.max_length
+        mask_token_id = config.mask_token_id
         steps = config.steps
-        guidance = config.guidance
+        eps = config.eps
+        temperature = config.temperature
+        top_k = config.top_k
+        top_p = config.top_p
+        algorithm = config.algorithm
         number_of_masks = config.number_of_masks
         number_of_transfer_tokens = config.number_of_transfer_tokens
-        mas_step_token = config.max_step_token
-        algorithm = config.algorithm
+        guidance = config.guidance
         algorithm_temperature = config.algorithm_temperature
         output_history = config.output_history
+        max_step_token = config.max_step_token
 
         # 特殊トークンのIDをモデル設定から取得、設定不備によるエラーを防ぐために存在チェックを行う
-        mask_token_id = (
-            config.mask_token_id
-            if config.mask_token_id is not None
-            else self.config.mask_token_id
-        )
-        pad_token_id = (
-            config.pad_token_id
-            if config.pad_token_id is not None
-            else self.config.pad_token_id
-        )
-        eos_token_id = (
-            config.eos_token_id
-            if config.eos_token_id is not None
-            else self.config.eos_token_id
-        )
+        mask_token_id = config.mask_token_id
+        pad_token_id = config.pad_token_id
+        eos_token_id = config.eos_token_id
 
         if mask_token_id is None or pad_token_id is None or eos_token_id is None:
             raise ValueError(
@@ -96,7 +98,7 @@ class DreamGenerationMixin(GenerationMixin):
 
         # 入力テンソルの形状を確認
         batch_size = input_ids.shape[0]
-        device = self.device
+        device = input_ids.device
 
         # 生成履歴を保存するリスト
         history: list[torch.Tensor] = []
@@ -156,6 +158,7 @@ class DreamGenerationMixin(GenerationMixin):
             else:
                 raise NotImplementedError(algorithm)
 
+            # 6. 新しいトークンをサンプリングする
             logits_to_transfer = torch.gather(
                 input=masked_logits,
                 dim=1,
@@ -164,13 +167,53 @@ class DreamGenerationMixin(GenerationMixin):
                 ),
             )
 
-            # ----6. 次のトークンをサンプリング ---------
-            logits_processor = self._get_logits_processor(
-                generation_config=config,
-                input_ids_seq_length=input_ids.shape[-1],
-                encoder_input_ids=input_ids,
-                prefix_allowed_tokens_fn=None,
-                logits_processor=LogitsProcessorList(),
-            )
+            # ヘルパー関数を使ってサンプリングする
+            next_tokens = sample_tokens(
+                logits=logits_to_transfer,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )[1].squeeze(dim=1)
 
-            processed_logits = logits_processor(input_ids=torch.empty(size=logits_to_transfer.shape[0], seq_length=1, device=device), scores=logits_to_transfer)
+            scatter_indices = input_ids.shape[1] - number_of_masks + transfer_indices
+            input_ids.scatter_(dim=1, index=scatter_indices, src=next_tokens)
+
+            new_masks_to_add = min(number_of_transfer_tokens, max_step_token)
+            new_masks = torch.full(
+                size=(batch_size, new_masks_to_add),
+                fill_value=mask_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+            new_mask_attention = torch.ones_like(input=new_masks)
+
+            input_ids = torch.cat([input_ids, new_masks], dim=1)
+            if attention_mask is not None:
+                attention_mask = torch.cat([attention_mask, new_mask_attention], dim=1)
+
+            # 現在のマスクの総数を更新
+            number_of_masks += new_masks_to_add - number_of_transfer_tokens
+            if output_history:
+                history.append(input_ids.clone())
+
+            if (input_ids == eos_token_id).all(dim=-1).all().item():
+                break
+
+        final_sequences = []
+        for i in range(batch_size):
+            is_mask = input_ids[i] == mask_token_id
+            if is_mask.any():
+                first_mask_index = is_mask.nonzero(as_tuple=True)[0][0].item()
+                final_sequences.append(input_ids[i, :first_mask_index])
+            else:
+                final_sequences.append(input_ids[i])
+
+        sequences = torch.nn.utils.rnn.pad_sequence(
+            sequences=final_sequences, batch_first=True, padding_value=pad_token_id
+        )
+
+        # 生成結果をまとめて返す
+        return DreamModelOutput(
+            sequences=sequences,
+            history=tuple(history) if output_history else None,
+        )
